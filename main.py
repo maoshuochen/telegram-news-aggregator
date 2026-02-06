@@ -1,7 +1,7 @@
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from config import BOT_TOKEN, CHANNELS, CHAT_ID
-from fetcher import get_channel_news
+from fetcher import get_channel_news, list_subscriptions, add_subscription
 from analyzer import analyze_news
 
 
@@ -34,11 +34,33 @@ async def digest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await status_msg.edit_text(report, parse_mode="Markdown")
 
 
+def list_subs_command(update, context):
+    subs = list_subscriptions()
+    if not subs:
+        update.message.reply_text("当前没有订阅源。使用 /add_sub <channel_id> 添加。")
+        return
+    update.message.reply_text("当前订阅源：\n" + "\n".join(subs))
+
+
+def add_sub_command(update, context):
+    if len(context.args) == 0:
+        update.message.reply_text("用法：/add_sub <channel_id>")
+        return
+    channel_id = context.args[0]
+    ok = add_subscription(channel_id)
+    if ok:
+        update.message.reply_text(f"已添加订阅：{channel_id}")
+    else:
+        update.message.reply_text(f"订阅已存在或无效：{channel_id}")
+
+
 if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("digest", digest_command))
+    app.add_handler(CommandHandler("list_subs", list_subs_command))
+    app.add_handler(CommandHandler("add_sub", add_sub_command))
 
     print("Bot 正在运行...")
     app.run_polling()

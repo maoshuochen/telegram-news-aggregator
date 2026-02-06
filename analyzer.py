@@ -23,7 +23,7 @@ def analyze_news(all_news):
     """
 
     response = client.chat.completions.create(
-        model="gpt-4o-mini",  # 或 deepseek-chat
+        model="gpt-5-mini",  # 或 deepseek-chat
         messages=[{"role": "user", "content": prompt}],
     )
     return response.choices[0].message.content
