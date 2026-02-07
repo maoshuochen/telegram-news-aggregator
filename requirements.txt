@@ -2,3 +2,4 @@ python-telegram-bot
 feedparser
 openai
 requests
+python-dotenv

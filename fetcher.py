@@ -4,6 +4,7 @@ import json
 from typing import List
 import logging
 from logger import get_logger, report_error
+from config import RSSHUB_BASE_URL, RSSHUB_FALLBACKS
 
 logger = get_logger(__name__)
 
@@ -74,18 +75,76 @@ def remove_subscription(channel_id: str) -> bool:
 
 
 def get_channel_news(channel_id, limit=5):
-    """通过 RSSHub 抓取指定频道的最新消息"""
-    rss_url = f"https://rsshub.app/telegram/channel/{channel_id}"
-    try:
-        feed = feedparser.parse(rss_url)
-    except Exception as e:
-        logger.exception("抓取频道 %s 时发生错误：%s", channel_id, e)
-        report_error(e, {"channel_id": channel_id, "url": rss_url})
+    """通过 RSSHub 抓取指定频道的最新消息，支持可配置的 RSSHub 实例和备用列表"""
+    bases = [RSSHUB_BASE_URL] + list(RSSHUB_FALLBACKS)
+    last_feed = None
+    last_url = None
+
+    for base in bases:
+        rss_url = f"{base.rstrip('/')}/telegram/channel/{channel_id}"
+        last_url = rss_url
+        try:
+            feed = feedparser.parse(rss_url)
+            status = getattr(feed, "status", None)
+            bozo = getattr(feed, "bozo", False)
+            bozo_exc = getattr(feed, "bozo_exception", None)
+            entries_len = len(getattr(feed, "entries", []))
+
+            logger.debug(
+                "RSS try: base=%s channel=%s status=%s bozo=%s entries=%d",
+                base,
+                channel_id,
+                status,
+                bozo,
+                entries_len,
+            )
+
+            if status and status != 200:
+                logger.warning(
+                    "RSSHub returned non-200 status for %s at %s: %s",
+                    channel_id,
+                    base,
+                    status,
+                )
+
+            if bozo and bozo_exc:
+                logger.warning(
+                    "feedparser bozo for %s at %s: %s", channel_id, base, bozo_exc
+                )
+                report_error(
+                    bozo_exc,
+                    {"channel_id": channel_id, "url": rss_url, "status": status},
+                )
+
+            # consider this feed successful if we have at least one entry and status is 200 or unknown
+            if entries_len > 0 and (status is None or status == 200):
+                last_feed = feed
+                logger.info(
+                    "Using RSSHub base %s for channel %s (entries=%d)",
+                    base,
+                    channel_id,
+                    entries_len,
+                )
+                break
+            else:
+                # try next base
+                logger.debug(
+                    "No entries from %s, will try next base if available", rss_url
+                )
+                continue
+
+        except Exception as e:
+            logger.exception("抓取频道 %s 在 %s 时发生错误：%s", channel_id, base, e)
+            report_error(e, {"channel_id": channel_id, "url": rss_url})
+            continue
+
+    if last_feed is None:
+        logger.warning("所有 RSSHub 实例均未返回内容，最后尝试 URL: %s", last_url)
         return []
 
     news_items = []
     try:
-        for entry in feed.entries[:limit]:
+        for entry in last_feed.entries[:limit]:
             news_items.append(
                 {
                     "source": channel_id,
@@ -96,7 +155,7 @@ def get_channel_news(channel_id, limit=5):
             )
     except Exception as e:
         logger.exception("解析 RSS 条目失败：%s", channel_id)
-        report_error(e, {"channel_id": channel_id, "url": rss_url})
+        report_error(e, {"channel_id": channel_id, "url": last_url})
     return news_items
 
 
