@@ -3,19 +3,51 @@ import os
 import json
 from typing import List
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from requests.exceptions import SSLError
 from logger import get_logger, report_error
-from config import RSSHUB_BASE_URL, RSSHUB_FALLBACKS
+from config import (
+    RSSHUB_BASE_URL,
+    RSSHUB_FALLBACKS,
+    RSSHUB_TIMEOUT,
+    RSS_ITEMS_PER_CHANNEL,
+    DEFAULT_CHANNELS,
+)
 
 logger = get_logger(__name__)
 
 SUBSCRIPTIONS_FILE = os.path.join(os.path.dirname(__file__), "subscriptions.json")
 
 
+def _build_session() -> requests.Session:
+    """Build a requests session with retry/backoff for transient errors."""
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=0.6,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+_SESSION = _build_session()
+
+
 def _ensure_subscriptions_file():
     if not os.path.exists(SUBSCRIPTIONS_FILE):
         try:
             with open(SUBSCRIPTIONS_FILE, "w", encoding="utf-8") as f:
-                json.dump([], f)
+                json.dump(DEFAULT_CHANNELS, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.exception("无法创建订阅文件 %s", SUBSCRIPTIONS_FILE)
             report_error(e, {"file": SUBSCRIPTIONS_FILE})
@@ -84,8 +116,9 @@ def get_channel_news(channel_id, limit=5):
         rss_url = f"{base.rstrip('/')}/telegram/channel/{channel_id}"
         last_url = rss_url
         try:
-            feed = feedparser.parse(rss_url)
-            status = getattr(feed, "status", None)
+            resp = _SESSION.get(rss_url, timeout=RSSHUB_TIMEOUT)
+            status = resp.status_code
+            feed = feedparser.parse(resp.content)
             bozo = getattr(feed, "bozo", False)
             bozo_exc = getattr(feed, "bozo_exception", None)
             entries_len = len(getattr(feed, "entries", []))
@@ -133,6 +166,10 @@ def get_channel_news(channel_id, limit=5):
                 )
                 continue
 
+        except SSLError as e:
+            logger.warning("SSL 错误，准备切换实例：channel=%s base=%s err=%s", channel_id, base, e)
+            report_error(e, {"channel_id": channel_id, "url": rss_url, "ssl": True})
+            continue
         except Exception as e:
             logger.exception("抓取频道 %s 在 %s 时发生错误：%s", channel_id, base, e)
             report_error(e, {"channel_id": channel_id, "url": rss_url})
@@ -159,15 +196,26 @@ def get_channel_news(channel_id, limit=5):
     return news_items
 
 
-def get_all_news(limit_per_channel=5):
+def get_all_news(limit_per_channel=RSS_ITEMS_PER_CHANNEL):
     """从所有已保存的订阅源抓取消息并合并返回"""
+    channels = load_subscriptions()
+    if not channels:
+        return []
+
     all_items = []
-    for ch in load_subscriptions():
-        try:
-            all_items.extend(get_channel_news(ch, limit=limit_per_channel))
-        except Exception as e:
-            # 简单忽略单个源错误，调用方可记录或处理
-            logger.error("抓取来源 %s 失败: %s", ch, e)
-            report_error(e, {"channel": ch})
-            continue
+    max_workers = min(5, len(channels))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(get_channel_news, ch, limit_per_channel): ch
+            for ch in channels
+        }
+        for future in as_completed(futures):
+            ch = futures[future]
+            try:
+                all_items.extend(future.result())
+            except Exception as e:
+                # 简单忽略单个源错误，调用方可记录或处理
+                logger.error("抓取来源 %s 失败: %s", ch, e)
+                report_error(e, {"channel": ch})
+                continue
     return all_items

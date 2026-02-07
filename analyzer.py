@@ -1,81 +1,135 @@
-from typing import List, Optional
+from typing import List
 import requests
+import time
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from config import LLM_API_KEY, LLM_BASE_URL
+from config import (
+    LLM_API_KEY,
+    LLM_BASE_URL,
+    LLM_MODEL,
+    ARTICLE_MAX_CHARS,
+    LLM_CONTEXT_LIMIT,
+    LLM_COMPLETION_LIMIT,
+    LLM_MAX_TOKENS,
+    LLM_TEMPERATURE,
+    LLM_THREADPOOL_WORKERS,
+    LLM_TIMEOUT,
+    LLM_RETRIES,
+    LLM_RETRY_BACKOFF,
+)
 from logger import get_logger, report_error
 
 logger = get_logger(__name__)
 
 # LLM 上下文限制（字符数估算，大致 prompt + completion 总和）
-# api2gpt gpt-5-mini 等模型的标准上下文约 128k tokens，保留 20% 安全余地
-ESTIMATED_CONTEXT_LIMIT = 120000  # 字符数（1 token ≈ 4 字符）
-ESTIMATED_COMPLETION_LIMIT = 20000  # 预留给输出的字符数
+# 通过环境变量 LLM_CONTEXT_LIMIT 配置
+ESTIMATED_CONTEXT_LIMIT = LLM_CONTEXT_LIMIT
+ESTIMATED_COMPLETION_LIMIT = LLM_COMPLETION_LIMIT  # 预留给输出的字符数
 
 # 可复用的线程池执行器（用于异步化同步操作）
-_executor = ThreadPoolExecutor(max_workers=3)
-
-
-def _estimate_tokens(text: str) -> int:
-    """粗略估算 token 数（字符数 / 4）"""
-    return len(text) // 4
+_executor = ThreadPoolExecutor(max_workers=LLM_THREADPOOL_WORKERS)
 
 
 def _truncate_news_items(all_news: List[dict], max_chars: int) -> List[dict]:
     """
     裁剪新闻项，确保总字符数不超过 max_chars。
-    优先保留完整项，超出后面的项将被截断或删除。
+    尽量保留更多条目，必要时等比例缩短内容。
     """
-    result = []
-    total_chars = 0
+    if not all_news:
+        return []
+
+    # 先计算每条的基础信息与内容长度
+    items = []
+    overhead = 0
     for item in all_news:
         source = item.get("source", "")
-        content = item.get("content", "")[:800]  # 单篇文章最多 800 字符
+        content = item.get("content", "") or ""
+        content = content[:ARTICLE_MAX_CHARS]
+        prefix = f"【来源: {source}】\n内容: "
+        suffix = "\n---\n"
+        overhead += len(prefix) + len(suffix)
+        items.append(
+            {"item": item, "content": content, "prefix": prefix, "suffix": suffix}
+        )
 
-        item_str = f"【来源: {source}】\n内容: {content}\n---\n"
-        item_chars = len(item_str)
+    # 可用字符预算
+    budget = max_chars - overhead
+    if budget <= 0:
+        return all_news[:1]
 
-        if total_chars + item_chars <= max_chars:
-            result.append(item)
-            total_chars += item_chars
-        else:
-            # 如果已有内容，就停止；否则至少保留一条
-            if result:
-                break
+    # 等比例分配内容长度，尽量保留更多条目
+    total_content_len = sum(len(x["content"]) for x in items)
+    if total_content_len <= budget:
+        return [x["item"] for x in items]
 
-    return result if result else all_news[:1]
+    ratio = budget / max(total_content_len, 1)
+    result = []
+    for x in items:
+        keep = max(50, int(len(x["content"]) * ratio))
+        new_item = dict(x["item"])
+        new_item["content"] = x["content"][:keep]
+        result.append(new_item)
+
+    return result
 
 
 def _call_llm_sync(
     prompt: str,
     max_tokens: int = 1200,
     attempt: int = 1,
-    parent_finish_reason: Optional[str] = None,
-) -> tuple[str, Optional[str]]:
+) -> str:
     """
     同步调用 LLM 的核心逻辑。
-    返回 (content, finish_reason)
-
-    如果 finish_reason == "length" 且 content 非空，可以调用者决定是否续写。
+    返回 content 或错误提示字符串。
     """
-    url = f"{LLM_BASE_URL.rstrip('/')}/v1/chat/completions"
+    base = LLM_BASE_URL.rstrip("/")
+    if base.endswith("/v1"):
+        url = f"{base}/chat/completions"
+    else:
+        url = f"{base}/v1/chat/completions"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {LLM_API_KEY}",
     }
     payload = {
-        "model": "gpt-5-mini",
+        "model": LLM_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
-        "temperature": 0.4,
+        "temperature": LLM_TEMPERATURE,
     }
 
-    try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=30)
-    except Exception as e:
-        logger.exception(f"[尝试 {attempt}] LLM 请求失败：%s", e)
-        report_error(e, {"url": url, "attempt": attempt})
-        return ("LLM 调用失败：无法连接到 LLM 服务，详见日志。", None)
+    for i in range(LLM_RETRIES + 1):
+        try:
+            resp = requests.post(
+                url, json=payload, headers=headers, timeout=LLM_TIMEOUT
+            )
+        except Exception as e:
+            if isinstance(e, requests.exceptions.Timeout):
+                err_msg = "LLM 调用超时，请稍后重试。"
+            elif isinstance(e, requests.exceptions.ConnectionError):
+                err_msg = "LLM 连接失败，请检查网络或服务状态。"
+            else:
+                err_msg = "LLM 调用失败：无法连接到 LLM 服务，详见日志。"
+            logger.exception(f"[尝试 {attempt}.{i}] LLM 请求失败：%s", e)
+            report_error(e, {"url": url, "attempt": attempt, "retry": i})
+            if i < LLM_RETRIES:
+                time.sleep(LLM_RETRY_BACKOFF * (i + 1))
+                continue
+            return err_msg
+
+        if resp.status_code in (429, 500, 502, 503, 504):
+            logger.warning(
+                "[尝试 %s.%s] LLM 返回可重试状态码：%s",
+                attempt,
+                i,
+                resp.status_code,
+            )
+            if i < LLM_RETRIES:
+                time.sleep(LLM_RETRY_BACKOFF * (i + 1))
+                continue
+            # fall through to error handling below
+        # non-retryable status or retries exhausted
+        break
 
     if resp.status_code != 200:
         logger.error(
@@ -94,24 +148,24 @@ def _call_llm_sync(
 
         # 识别常见错误
         if parsed_err and parsed_err.get("code") == "40003":
-            return ("LLM API key 无效或不存在，请检查 LLM_API_KEY。", None)
+            return "LLM API key 无效或不存在，请检查 LLM_API_KEY。"
         if (
             parsed_err
             and isinstance(parsed_err.get("message"), str)
             and "key does not exist" in parsed_err.get("message")
         ):
-            return ("LLM API key 无效或不存在，请检查 LLM_API_KEY。", None)
+            return "LLM API key 无效或不存在，请检查 LLM_API_KEY。"
         if "key does not exist" in (resp.text or ""):
-            return ("LLM API key 无效或不存在，请检查 LLM_API_KEY。", None)
+            return "LLM API key 无效或不存在，请检查 LLM_API_KEY。"
 
-        return (f"LLM 调用失败：{resp.status_code}", None)
+        if 400 <= resp.status_code < 500:
+            return f"LLM 请求被拒绝（{resp.status_code}），请检查请求参数。"
+        return f"LLM 调用失败：{resp.status_code}"
 
     try:
         data = resp.json()
         if "choices" in data and len(data["choices"]) > 0:
             choice = data["choices"][0]
-            finish_reason = choice.get("finish_reason")
-
             # 提取内容
             content = ""
             if "message" in choice and "content" in choice["message"]:
@@ -120,125 +174,88 @@ def _call_llm_sync(
                 content = choice["text"]
 
             logger.debug(
-                f"[尝试 {attempt}] LLM 返回 finish_reason={finish_reason}, "
-                f"content_len={len(content)}, tokens={data.get('usage', {})}"
+                f"[尝试 {attempt}] LLM 返回 content_len={len(content)}, tokens={data.get('usage', {})}"
             )
 
             # 检查内容是否为空
             if not content or not str(content).strip():
                 logger.error(
-                    f"[尝试 {attempt}] LLM 返回空内容 (finish_reason={finish_reason}): %s",
+                    f"[尝试 {attempt}] LLM 返回空内容: %s",
                     data,
                 )
                 report_error(
                     Exception("LLM returned empty content"),
                     {"response": data, "attempt": attempt},
                 )
-                return ("LLM 未返回可用内容，请检查日志或稍后重试。", finish_reason)
+                return "LLM 未返回可用内容，请检查日志或稍后重试。"
 
-            return (content, finish_reason)
+            return content
 
         logger.error(f"[尝试 {attempt}] LLM 返回格式不符合预期：%s", data)
-        return ("LLM 返回了不可解析的响应，详见日志。", None)
+        return "LLM 返回了不可解析的响应，详见日志。"
 
     except Exception as e:
         logger.exception(f"[尝试 {attempt}] 解析 LLM 响应失败：%s", e)
         report_error(e, {"response_text": resp.text, "attempt": attempt})
-        return ("解析 LLM 响应失败，详见日志。", None)
+        return "解析 LLM 响应失败，详见日志。"
+
+
+def _build_prompt(context: str) -> str:
+    return f"""你是一个资深的新闻分析师。以下是来自不同来源的资讯信息：
+{context}
+
+请执行以下任务：
+1. 聚合相同事件：将讨论同一件事的新闻归类。
+2. 多维度分析：如果同一个事件有多个来源，请对比它们在报道立场、侧重点或细节上的差异。
+3. 精选：选出最值得关注的 10 条新闻。
+
+输出格式（严格遵守）：
+【序号】标题
+- 摘要：1 句
+- 影响：1 句
+- 来源：来源名[链接]; 来源名[链接]
+
+要求：
+- 仅输出 10 条，不足 10 条也不要编造或重复
+- 标题不超过 20 字
+- 每条必须是不同事件，不得把同一事件拆成多条
+- 优先覆盖更多不同来源；若来源数量接近，以新闻重要性排序
+- 来源必须使用原始链接，若有 Telegram 消息链接则优先使用（t.me/ 开头）
+- 使用 Telegram MarkdownV2 的链接格式：来源名[链接] 写成 [来源名](URL)
+- 不要向用户提问或要求补充信息
+"""
 
 
 async def analyze_news(all_news: List[dict]) -> str:
     """
     异步分析新闻。
 
-    流程：
-    1. 估算 token，若超出则裁剪新闻项
-    2. 在线程池中调用 LLM（避免阻塞事件循环）
-    3. 若返回 finish_reason="length" 且内容非空，尝试续写
-    4. 若内容为空且超出 token，则裁剪后重试
+    简化流程：
+    1. 裁剪新闻项
+    2. 完整 prompt 调用
     """
     # 裁剪输入以确保不超过上下文限制
     max_input_chars = ESTIMATED_CONTEXT_LIMIT - ESTIMATED_COMPLETION_LIMIT
     truncated_news = _truncate_news_items(all_news, max_input_chars)
 
-    # 构建初始 prompt
+    # 构建上下文
     context = ""
     for item in truncated_news:
         context += f"【来源: {item['source']}】\n内容: {item.get('content','')}\n---\n"
 
-    prompt = f"""你是一个资深的新闻分析师。以下是过去几个小时内不同来源的资讯信息：
-{context}
-
-请执行以下任务：
-1. 聚合相同事件：将讨论同一件事的新闻归类。
-2. 多维度分析：如果同一个事件有多个来源，请对比它们在报道立场、侧重点或细节上的差异。
-3. 每日精选：选出最值得关注的 3 条新闻。
-
-请用 Markdown 格式输出，语言简洁专业。"""
-
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     # 第一次调用：完整 prompt
-    content, finish_reason = await loop.run_in_executor(
+    content = await loop.run_in_executor(
         _executor,
         _call_llm_sync,
-        prompt,
-        1200,  # max_tokens
+        _build_prompt(context),
+        LLM_MAX_TOKENS,  # max_tokens
         1,  # attempt
-        None,  # parent_finish_reason
     )
 
-    # 若出错或返回了完整响应，直接返回
-    if not isinstance(content, str) or content.startswith("LLM"):
-        return content
-
-    # 若因长度被截断且有内容，尝试续写
-    if finish_reason == "length" and content:
-        logger.info("检测到 finish_reason=length，尝试续写...")
-        continuation_prompt = f"""继续完成上述分析任务。已完成内容：
-{content}
-
-请从上面中断的地方继续，补充剩余的分析内容。"""
-
-        continuation, _ = await loop.run_in_executor(
-            _executor,
-            _call_llm_sync,
-            continuation_prompt,
-            800,  # 续写时减少 max_tokens
-            2,  # attempt 2
-            finish_reason,
-        )
-
-        if continuation and not continuation.startswith("LLM"):
-            return content + "\n\n" + continuation
-        # 续写失败，返回已有内容
-        return content
-
-    # 若内容为空且 token 超出，尝试更激进地裁剪后重试
-    if not content or content.startswith("LLM"):
-        if _estimate_tokens(prompt) > ESTIMATED_CONTEXT_LIMIT * 0.8:
-            logger.warning("Token 预估超过 80% 限制，进行激进裁剪并重试...")
-            aggressive_truncated = _truncate_news_items(all_news, max_input_chars // 2)
-
-            aggressive_context = ""
-            for item in aggressive_truncated:
-                aggressive_context += f"【来源: {item['source']}】\n内容: {item.get('content','')[:400]}\n---\n"
-
-            aggressive_prompt = f"""你是一个新闻分析师。这是来自多个来源的资讯摘要：
-{aggressive_context}
-
-请简洁地聚合主要事件并列出 3 条最值得关注的新闻，用 Markdown 格式输出。"""
-
-            retry_content, _ = await loop.run_in_executor(
-                _executor,
-                _call_llm_sync,
-                aggressive_prompt,
-                800,
-                3,  # attempt 3
-                finish_reason,
-            )
-
-            if retry_content and not retry_content.startswith("LLM"):
-                return retry_content
-
-    return content if content else "LLM 未返回可用内容，请检查日志或稍后重试。"
+    return (
+        content
+        if isinstance(content, str) and content.strip()
+        else "LLM 未返回可用内容，请检查日志或稍后重试。"
+    )
